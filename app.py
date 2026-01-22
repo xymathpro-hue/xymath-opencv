@@ -10,23 +10,19 @@ from flask_cors import CORS
 import cv2
 import numpy as np
 import base64
-from pyzbar.pyzbar import decode
-import io
-from PIL import Image
 import os
 
 app = Flask(__name__)
-CORS(app)  # Permitir requisições do xymath.com.br
+CORS(app)
 
 # Configurações
-BUBBLE_THRESHOLD = 0.4  # Limiar para considerar bolha preenchida
-MIN_BUBBLE_AREA = 100   # Área mínima para detectar bolha
-MAX_BUBBLE_AREA = 2000  # Área máxima para detectar bolha
+BUBBLE_THRESHOLD = 0.4
+MIN_BUBBLE_AREA = 100
+MAX_BUBBLE_AREA = 2000
 
 
 def decode_base64_image(base64_string):
     """Converte imagem base64 para OpenCV"""
-    # Remove header se existir
     if 'base64,' in base64_string:
         base64_string = base64_string.split('base64,')[1]
     
@@ -38,19 +34,16 @@ def decode_base64_image(base64_string):
 
 def find_corner_markers(image):
     """
-    Detecta os 4 marcadores de canto (quadrados pretos) na folha de respostas
-    Retorna as coordenadas ordenadas: [top-left, top-right, bottom-right, bottom-left]
+    Detecta os 4 marcadores de canto (quadrados pretos)
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # Threshold adaptativo para lidar com diferentes iluminações
     thresh = cv2.adaptiveThreshold(
         blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
         cv2.THRESH_BINARY_INV, 11, 2
     )
     
-    # Encontrar contornos
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     markers = []
@@ -59,50 +52,38 @@ def find_corner_markers(image):
         if area < 500 or area > 10000:
             continue
         
-        # Aproximar para polígono
         peri = cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
         
-        # Verificar se é quadrado (4 lados)
         if len(approx) == 4:
             x, y, w, h = cv2.boundingRect(approx)
             aspect_ratio = w / float(h)
             
-            # Quadrado tem aspect ratio próximo de 1
             if 0.8 <= aspect_ratio <= 1.2:
-                # Calcular centro do marcador
                 M = cv2.moments(contour)
                 if M["m00"] != 0:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
                     markers.append((cx, cy, area))
     
-    # Ordenar por área (pegar os 4 maiores quadrados)
     markers.sort(key=lambda x: x[2], reverse=True)
     markers = markers[:4]
     
     if len(markers) < 4:
         return None
     
-    # Extrair apenas coordenadas
     points = [(m[0], m[1]) for m in markers]
-    
-    # Ordenar: top-left, top-right, bottom-right, bottom-left
-    points = sorted(points, key=lambda p: p[1])  # Ordenar por Y
-    top_points = sorted(points[:2], key=lambda p: p[0])  # Top: ordenar por X
-    bottom_points = sorted(points[2:], key=lambda p: p[0])  # Bottom: ordenar por X
+    points = sorted(points, key=lambda p: p[1])
+    top_points = sorted(points[:2], key=lambda p: p[0])
+    bottom_points = sorted(points[2:], key=lambda p: p[0])
     
     return [top_points[0], top_points[1], bottom_points[1], bottom_points[0]]
 
 
 def perspective_transform(image, corners):
-    """
-    Corrige a perspectiva da imagem usando os 4 cantos detectados
-    """
-    # Pontos de origem
+    """Corrige a perspectiva da imagem"""
     pts1 = np.float32(corners)
     
-    # Calcular dimensões do retângulo de destino
     width = max(
         np.linalg.norm(np.array(corners[0]) - np.array(corners[1])),
         np.linalg.norm(np.array(corners[3]) - np.array(corners[2]))
@@ -112,7 +93,6 @@ def perspective_transform(image, corners):
         np.linalg.norm(np.array(corners[1]) - np.array(corners[2]))
     )
     
-    # Pontos de destino (retângulo perfeito)
     pts2 = np.float32([
         [0, 0],
         [width, 0],
@@ -120,10 +100,7 @@ def perspective_transform(image, corners):
         [0, height]
     ])
     
-    # Calcular matriz de transformação
     matrix = cv2.getPerspectiveTransform(pts1, pts2)
-    
-    # Aplicar transformação
     result = cv2.warpPerspective(image, matrix, (int(width), int(height)))
     
     return result
@@ -131,15 +108,16 @@ def perspective_transform(image, corners):
 
 def read_qr_code(image):
     """
-    Lê o QR Code da folha de respostas
-    Retorna: { simulado_id, aluno_id, turma_id, total_questoes }
+    Lê o QR Code usando OpenCV QRCodeDetector
+    Formato esperado: simulado_id|aluno_id|turma_id|total_questoes
     """
-    decoded = decode(image)
+    detector = cv2.QRCodeDetector()
     
-    for obj in decoded:
+    # Tentar detectar QR code
+    data, vertices, _ = detector.detectAndDecode(image)
+    
+    if data:
         try:
-            data = obj.data.decode('utf-8')
-            # Formato esperado: simulado_id|aluno_id|turma_id|total_questoes
             parts = data.split('|')
             if len(parts) >= 4:
                 return {
@@ -149,7 +127,24 @@ def read_qr_code(image):
                     'total_questoes': int(parts[3])
                 }
         except:
-            continue
+            pass
+    
+    # Tentar com imagem em escala de cinza
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    data, vertices, _ = detector.detectAndDecode(gray)
+    
+    if data:
+        try:
+            parts = data.split('|')
+            if len(parts) >= 4:
+                return {
+                    'simulado_id': parts[0],
+                    'aluno_id': parts[1],
+                    'turma_id': parts[2],
+                    'total_questoes': int(parts[3])
+                }
+        except:
+            pass
     
     return None
 
@@ -157,39 +152,27 @@ def read_qr_code(image):
 def detect_bubbles(image, num_questions, options_per_question=5):
     """
     Detecta as bolhas preenchidas na folha de respostas
-    
-    Parâmetros:
-    - image: imagem já corrigida (perspectiva)
-    - num_questions: número de questões esperadas
-    - options_per_question: número de alternativas (A, B, C, D, E)
-    
-    Retorna: lista de respostas ['A', 'B', None, 'C', ...]
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # Threshold para detectar bolhas preenchidas
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # Encontrar contornos
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Filtrar contornos que parecem bolhas (círculos)
     bubbles = []
     for contour in contours:
         area = cv2.contourArea(contour)
         if MIN_BUBBLE_AREA < area < MAX_BUBBLE_AREA:
-            # Verificar circularidade
             perimeter = cv2.arcLength(contour, True)
             if perimeter > 0:
                 circularity = 4 * np.pi * area / (perimeter * perimeter)
-                if circularity > 0.6:  # Círculos têm circularidade próxima de 1
+                if circularity > 0.6:
                     M = cv2.moments(contour)
                     if M["m00"] != 0:
                         cx = int(M["m10"] / M["m00"])
                         cy = int(M["m01"] / M["m00"])
                         
-                        # Calcular intensidade média dentro da bolha
                         mask = np.zeros(gray.shape, dtype=np.uint8)
                         cv2.drawContours(mask, [contour], -1, 255, -1)
                         mean_val = cv2.mean(gray, mask=mask)[0]
@@ -205,31 +188,25 @@ def detect_bubbles(image, num_questions, options_per_question=5):
     if not bubbles:
         return [None] * num_questions
     
-    # Agrupar bolhas por linha (questão) usando clustering
     bubbles.sort(key=lambda b: b['y'])
     
-    # Determinar altura da imagem e dividir em linhas
     img_height = image.shape[0]
     img_width = image.shape[1]
     
-    # Estimar posição da área de bolhas (assumindo que começa após o QR code)
-    bubble_area_start_y = int(img_height * 0.15)  # 15% do topo
+    bubble_area_start_y = int(img_height * 0.15)
     bubble_area_height = img_height - bubble_area_start_y
     row_height = bubble_area_height / num_questions
     
-    # Agrupar bolhas por questão
     questions = [[] for _ in range(num_questions)]
     
     for bubble in bubbles:
         if bubble['y'] < bubble_area_start_y:
             continue
         
-        # Determinar qual questão
         question_idx = int((bubble['y'] - bubble_area_start_y) / row_height)
         if 0 <= question_idx < num_questions:
             questions[question_idx].append(bubble)
     
-    # Para cada questão, determinar qual alternativa foi marcada
     answers = []
     options = ['A', 'B', 'C', 'D', 'E'][:options_per_question]
     
@@ -238,18 +215,12 @@ def detect_bubbles(image, num_questions, options_per_question=5):
             answers.append(None)
             continue
         
-        # Ordenar bolhas por X (da esquerda para direita = A, B, C, D, E)
         q_bubbles.sort(key=lambda b: b['x'])
         
-        # Encontrar a bolha mais escura (mais preenchida)
         darkest = min(q_bubbles, key=lambda b: b['intensity'])
-        
-        # Calcular média de intensidade para comparação
         avg_intensity = sum(b['intensity'] for b in q_bubbles) / len(q_bubbles)
         
-        # Se a mais escura for significativamente mais escura que a média
         if darkest['intensity'] < avg_intensity * 0.7:
-            # Determinar qual opção é baseado na posição X
             option_width = img_width / options_per_question
             option_idx = int(darkest['x'] / option_width)
             
@@ -258,42 +229,28 @@ def detect_bubbles(image, num_questions, options_per_question=5):
             else:
                 answers.append(None)
         else:
-            # Nenhuma bolha claramente marcada
             answers.append(None)
     
     return answers
 
 
 def process_answer_sheet(image):
-    """
-    Processa uma folha de respostas completa
-    
-    Retorna:
-    {
-        'success': bool,
-        'qr_data': { simulado_id, aluno_id, turma_id, total_questoes },
-        'answers': ['A', 'B', 'C', ...],
-        'error': string (se houver erro)
-    }
-    """
+    """Processa uma folha de respostas completa"""
     try:
         # 1. Detectar marcadores de canto
         corners = find_corner_markers(image)
         
         if corners is None:
-            return {
-                'success': False,
-                'error': 'Não foi possível detectar os marcadores de canto. Certifique-se de que a folha está bem iluminada e visível.'
-            }
-        
-        # 2. Corrigir perspectiva
-        corrected = perspective_transform(image, corners)
+            # Tentar sem correção de perspectiva
+            corrected = image
+        else:
+            # 2. Corrigir perspectiva
+            corrected = perspective_transform(image, corners)
         
         # 3. Ler QR Code
         qr_data = read_qr_code(corrected)
         
         if qr_data is None:
-            # Tentar ler na imagem original
             qr_data = read_qr_code(image)
         
         if qr_data is None:
@@ -335,22 +292,7 @@ def health_check():
 
 @app.route('/api/process', methods=['POST'])
 def process_image():
-    """
-    Endpoint principal para processar imagem de gabarito
-    
-    Body (JSON):
-    {
-        "image": "base64_encoded_image"
-    }
-    
-    Retorna:
-    {
-        "success": true/false,
-        "qr_data": { ... },
-        "answers": ["A", "B", ...],
-        "error": "mensagem de erro"
-    }
-    """
+    """Endpoint principal para processar imagem de gabarito"""
     try:
         data = request.get_json()
         
@@ -360,7 +302,6 @@ def process_image():
                 'error': 'Imagem não fornecida'
             }), 400
         
-        # Decodificar imagem
         image = decode_base64_image(data['image'])
         
         if image is None:
@@ -369,7 +310,6 @@ def process_image():
                 'error': 'Não foi possível decodificar a imagem'
             }), 400
         
-        # Processar
         result = process_answer_sheet(image)
         
         return jsonify(result)
@@ -383,9 +323,7 @@ def process_image():
 
 @app.route('/api/detect-qr', methods=['POST'])
 def detect_qr_only():
-    """
-    Endpoint para detectar apenas o QR Code (validação rápida)
-    """
+    """Endpoint para detectar apenas o QR Code"""
     try:
         data = request.get_json()
         
@@ -418,14 +356,7 @@ def detect_qr_only():
 
 @app.route('/api/batch', methods=['POST'])
 def batch_process():
-    """
-    Endpoint para processar múltiplas imagens de uma vez
-    
-    Body (JSON):
-    {
-        "images": ["base64_1", "base64_2", ...]
-    }
-    """
+    """Endpoint para processar múltiplas imagens"""
     try:
         data = request.get_json()
         
