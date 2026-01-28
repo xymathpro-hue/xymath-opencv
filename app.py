@@ -1,6 +1,6 @@
 """
 xyMath - API de Correção Automática de Gabaritos
-Usando OpenCV + pyzbar para processamento de imagem
+Usando OpenCV para processamento de imagem
 
 Deploy: Railway
 """
@@ -13,21 +13,13 @@ import base64
 import json
 import os
 
-# Tentar importar pyzbar (melhor para QR Code)
-try:
-    from pyzbar import pyzbar
-    PYZBAR_AVAILABLE = True
-except ImportError:
-    PYZBAR_AVAILABLE = False
-
 app = Flask(__name__)
 CORS(app)
 
 # Configurações
-BUBBLE_THRESHOLD = 0.5
 MIN_BUBBLE_AREA = 80
 MAX_BUBBLE_AREA = 3000
-FILLED_THRESHOLD = 0.35  # Limiar para considerar bolha preenchida
+FILLED_THRESHOLD = 0.35
 
 
 def decode_base64_image(base64_string):
@@ -42,76 +34,49 @@ def decode_base64_image(base64_string):
 
 
 def read_qr_code(image):
-    """
-    Lê o QR Code usando pyzbar (preferido) ou OpenCV
-    Suporta formato JSON: {"s":"id","a":"id","t":"id","q":15}
-    """
-    qr_data = None
-    qr_location = None
+    """Lê QR Code usando OpenCV - suporta JSON"""
+    detector = cv2.QRCodeDetector()
     
-    # Converter para escala de cinza
-    if len(image.shape) == 3:
+    # Tentar com imagem original
+    data, vertices, _ = detector.detectAndDecode(image)
+    
+    if not data:
+        # Tentar com escala de cinza
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image
+        data, vertices, _ = detector.detectAndDecode(gray)
     
-    # Método 1: pyzbar (mais confiável)
-    if PYZBAR_AVAILABLE:
-        # Tentar com imagem original
-        decoded = pyzbar.decode(image)
-        if not decoded:
-            # Tentar com escala de cinza
-            decoded = pyzbar.decode(gray)
-        if not decoded:
-            # Tentar com threshold
-            _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-            decoded = pyzbar.decode(thresh)
-        if not decoded:
-            # Tentar com adaptive threshold
-            thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-            decoded = pyzbar.decode(thresh)
-        
-        if decoded:
-            data = decoded[0].data.decode('utf-8')
-            rect = decoded[0].rect
+    if not data:
+        # Tentar com threshold
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+        data, vertices, _ = detector.detectAndDecode(thresh)
+    
+    if not data:
+        # Tentar com contraste aumentado
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        data, vertices, _ = detector.detectAndDecode(enhanced)
+    
+    if data:
+        qr_location = None
+        if vertices is not None and len(vertices) > 0:
+            pts = vertices[0]
+            x_coords = [p[0] for p in pts]
+            y_coords = [p[1] for p in pts]
             qr_location = {
-                'x': rect.left,
-                'y': rect.top,
-                'width': rect.width,
-                'height': rect.height
+                'x': int(min(x_coords)),
+                'y': int(min(y_coords)),
+                'width': int(max(x_coords) - min(x_coords)),
+                'height': int(max(y_coords) - min(y_coords))
             }
-            qr_data = parse_qr_data(data)
+        return parse_qr_data(data), qr_location
     
-    # Método 2: OpenCV QRCodeDetector (fallback)
-    if qr_data is None:
-        detector = cv2.QRCodeDetector()
-        
-        # Tentar várias versões da imagem
-        for img in [image, gray]:
-            data, vertices, _ = detector.detectAndDecode(img)
-            if data:
-                qr_data = parse_qr_data(data)
-                if vertices is not None and len(vertices) > 0:
-                    pts = vertices[0]
-                    x_coords = [p[0] for p in pts]
-                    y_coords = [p[1] for p in pts]
-                    qr_location = {
-                        'x': int(min(x_coords)),
-                        'y': int(min(y_coords)),
-                        'width': int(max(x_coords) - min(x_coords)),
-                        'height': int(max(y_coords) - min(y_coords))
-                    }
-                break
-    
-    return qr_data, qr_location
+    return None, None
 
 
 def parse_qr_data(data):
-    """
-    Parse QR Code data - suporta JSON e formato pipe
-    JSON: {"s":"simulado_id","a":"aluno_id","t":"turma_id","q":15}
-    Pipe: simulado_id|aluno_id|turma_id|total_questoes
-    """
+    """Parse QR Code - suporta JSON e formato pipe"""
     if not data:
         return None
     
@@ -124,7 +89,7 @@ def parse_qr_data(data):
             'turma_id': json_data.get('t') or json_data.get('turma_id'),
             'total_questoes': int(json_data.get('q') or json_data.get('total_questoes') or 20)
         }
-    except (json.JSONDecodeError, TypeError):
+    except:
         pass
     
     # Tentar formato pipe
@@ -144,7 +109,7 @@ def parse_qr_data(data):
 
 
 def find_corner_markers(image):
-    """Detecta os 4 marcadores de canto (quadrados pretos)"""
+    """Detecta os 4 marcadores de canto"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
@@ -202,37 +167,28 @@ def perspective_transform(image, corners):
         np.linalg.norm(np.array(corners[1]) - np.array(corners[2]))
     )
     
-    pts2 = np.float32([
-        [0, 0],
-        [width, 0],
-        [width, height],
-        [0, height]
-    ])
+    pts2 = np.float32([[0, 0], [width, 0], [width, height], [0, height]])
     
     matrix = cv2.getPerspectiveTransform(pts1, pts2)
     result = cv2.warpPerspective(image, matrix, (int(width), int(height)))
     
-    return result, matrix
-    def detect_bubbles(image, num_questions, options_per_question=5):
-    """
-    Detecta as bolhas preenchidas na folha de respostas
-    Retorna: answers (lista), bubble_locations (coordenadas para overlay)
-    """
+    return result
+
+
+def detect_bubbles(image, num_questions, options_per_question=5):
+    """Detecta bolhas preenchidas"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
     
-    # Threshold adaptativo para melhor detecção
     thresh = cv2.adaptiveThreshold(
         blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV, 15, 4
     )
     
-    # Encontrar contornos
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     img_height, img_width = image.shape[:2]
     
-    # Filtrar bolhas por tamanho e circularidade
     bubbles = []
     for contour in contours:
         area = cv2.contourArea(contour)
@@ -240,13 +196,12 @@ def perspective_transform(image, corners):
             perimeter = cv2.arcLength(contour, True)
             if perimeter > 0:
                 circularity = 4 * np.pi * area / (perimeter * perimeter)
-                if circularity > 0.5:  # Círculos têm circularity ~1.0
+                if circularity > 0.5:
                     M = cv2.moments(contour)
                     if M["m00"] != 0:
                         cx = int(M["m10"] / M["m00"])
                         cy = int(M["m01"] / M["m00"])
                         
-                        # Calcular preenchimento (intensidade média dentro da bolha)
                         mask = np.zeros(gray.shape, dtype=np.uint8)
                         cv2.drawContours(mask, [contour], -1, 255, -1)
                         mean_val = cv2.mean(gray, mask=mask)[0]
@@ -254,52 +209,38 @@ def perspective_transform(image, corners):
                         x, y, w, h = cv2.boundingRect(contour)
                         
                         bubbles.append({
-                            'x': cx,
-                            'y': cy,
-                            'area': area,
+                            'x': cx, 'y': cy, 'area': area,
                             'intensity': mean_val,
-                            'rect': {'x': x, 'y': y, 'w': w, 'h': h},
-                            'contour': contour
+                            'rect': {'x': x, 'y': y, 'w': w, 'h': h}
                         })
     
     if not bubbles:
         return [None] * num_questions, []
     
-    # Área das bolhas (excluir cabeçalho ~20% superior)
+    # Layout 2 colunas
     bubble_area_start_y = int(img_height * 0.20)
     bubble_area_end_y = int(img_height * 0.95)
     bubble_area_height = bubble_area_end_y - bubble_area_start_y
     
-    # Calcular questões por coluna (layout 2 colunas)
     questions_per_column = (num_questions + 1) // 2
     row_height = bubble_area_height / questions_per_column
     column_width = img_width / 2
     
-    # Organizar bolhas por questão
     questions = [[] for _ in range(num_questions)]
     
     for bubble in bubbles:
-        # Ignorar bolhas fora da área de respostas
         if bubble['y'] < bubble_area_start_y or bubble['y'] > bubble_area_end_y:
             continue
         
-        # Determinar coluna (esquerda ou direita)
         col = 0 if bubble['x'] < column_width else 1
-        
-        # Determinar linha dentro da coluna
         relative_y = bubble['y'] - bubble_area_start_y
         row = int(relative_y / row_height)
         
-        # Calcular índice da questão
-        if col == 0:
-            question_idx = row
-        else:
-            question_idx = questions_per_column + row
+        question_idx = row if col == 0 else questions_per_column + row
         
         if 0 <= question_idx < num_questions:
             questions[question_idx].append(bubble)
     
-    # Processar cada questão
     answers = []
     bubble_locations = []
     options = ['A', 'B', 'C', 'D', 'E'][:options_per_question]
@@ -307,115 +248,64 @@ def perspective_transform(image, corners):
     for q_idx, q_bubbles in enumerate(questions):
         if not q_bubbles:
             answers.append(None)
-            bubble_locations.append({
-                'question': q_idx + 1,
-                'answer': None,
-                'status': 'not_found',
-                'bubbles': []
-            })
+            bubble_locations.append({'question': q_idx + 1, 'answer': None, 'status': 'not_found', 'bubbles': []})
             continue
         
-        # Ordenar bolhas da esquerda para direita
         q_bubbles.sort(key=lambda b: b['x'])
-        
-        # Calcular intensidade média de todas as bolhas da questão
         avg_intensity = sum(b['intensity'] for b in q_bubbles) / len(q_bubbles)
         
-        # Encontrar bolhas preenchidas (mais escuras que a média)
-        filled_bubbles = []
-        for i, bubble in enumerate(q_bubbles):
-            # Bolha é considerada preenchida se for significativamente mais escura
-            if bubble['intensity'] < avg_intensity * (1 - FILLED_THRESHOLD):
-                filled_bubbles.append((i, bubble))
+        filled = [(i, b) for i, b in enumerate(q_bubbles) if b['intensity'] < avg_intensity * (1 - FILLED_THRESHOLD)]
         
-        # Preparar dados de localização
         bubbles_info = []
         for i, bubble in enumerate(q_bubbles):
-            option_letter = options[i] if i < len(options) else '?'
-            is_filled = any(fb[0] == i for fb in filled_bubbles)
-            bubbles_info.append({
-                'option': option_letter,
-                'x': bubble['x'],
-                'y': bubble['y'],
-                'rect': bubble['rect'],
-                'filled': is_filled,
-                'intensity': bubble['intensity']
-            })
+            opt = options[i] if i < len(options) else '?'
+            is_filled = any(f[0] == i for f in filled)
+            bubbles_info.append({'option': opt, 'x': bubble['x'], 'y': bubble['y'], 'rect': bubble['rect'], 'filled': is_filled})
         
-        # Determinar resposta
-        if len(filled_bubbles) == 0:
-            # Nenhuma bolha preenchida = em branco
+        if len(filled) == 0:
             answers.append(None)
             status = 'blank'
             answer = None
-        elif len(filled_bubbles) == 1:
-            # Exatamente uma bolha preenchida = resposta válida
-            idx = filled_bubbles[0][0]
-            if idx < len(options):
-                answer = options[idx]
-                answers.append(answer)
-                status = 'valid'
-            else:
-                answers.append(None)
-                answer = None
-                status = 'invalid'
+        elif len(filled) == 1:
+            idx = filled[0][0]
+            answer = options[idx] if idx < len(options) else None
+            answers.append(answer)
+            status = 'valid'
         else:
-            # Múltiplas bolhas preenchidas = ANULADA
-            answers.append('X')  # X indica múltipla marcação (anulada)
+            answers.append('X')
             answer = 'X'
             status = 'multiple'
         
-        bubble_locations.append({
-            'question': q_idx + 1,
-            'answer': answer,
-            'status': status,
-            'bubbles': bubbles_info
-        })
+        bubble_locations.append({'question': q_idx + 1, 'answer': answer, 'status': status, 'bubbles': bubbles_info})
     
     return answers, bubble_locations
 
 
 def process_answer_sheet(image):
-    """Processa uma folha de respostas completa"""
+    """Processa folha de respostas completa"""
     try:
-        original_image = image.copy()
         img_height, img_width = image.shape[:2]
         
-        # 1. Tentar ler QR Code primeiro (antes de qualquer transformação)
         qr_data, qr_location = read_qr_code(image)
         
-        # 2. Detectar marcadores de canto
         corners = find_corner_markers(image)
-        transform_matrix = None
         
         if corners is not None:
-            # 3. Corrigir perspectiva
-            corrected, transform_matrix = perspective_transform(image, corners)
-            
-            # Tentar ler QR novamente na imagem corrigida
+            corrected = perspective_transform(image, corners)
             if qr_data is None:
                 qr_data, qr_location = read_qr_code(corrected)
         else:
             corrected = image
         
-        # Se ainda não leu o QR Code, retornar erro
         if qr_data is None:
             return {
                 'success': False,
-                'error': 'QR Code não encontrado. Verifique se está visível e bem iluminado.',
-                'corners_found': corners is not None,
-                'qr_location': qr_location
+                'error': 'QR Code não encontrado. Verifique iluminação e posição.',
+                'corners_found': corners is not None
             }
         
-        # 4. Detectar bolhas preenchidas
         num_questions = qr_data.get('total_questoes', 20)
         answers, bubble_locations = detect_bubbles(corrected, num_questions)
-        
-        # Contar estatísticas
-        total_detected = len([a for a in answers if a is not None])
-        total_blank = len([a for a in answers if a is None])
-        total_multiple = len([a for a in answers if a == 'X'])
-        total_valid = len([a for a in answers if a is not None and a != 'X'])
         
         return {
             'success': True,
@@ -424,185 +314,59 @@ def process_answer_sheet(image):
             'answers': answers,
             'bubble_locations': bubble_locations,
             'total_questions': num_questions,
-            'total_detected': total_detected,
-            'total_valid': total_valid,
-            'total_blank': total_blank,
-            'total_multiple': total_multiple,
+            'total_detected': len([a for a in answers if a is not None]),
+            'total_valid': len([a for a in answers if a and a != 'X']),
+            'total_blank': len([a for a in answers if a is None]),
+            'total_multiple': len([a for a in answers if a == 'X']),
             'corners_found': corners is not None,
             'image_size': {'width': img_width, 'height': img_height}
         }
         
     except Exception as e:
-        import traceback
-        return {
-            'success': False,
-            'error': f'Erro ao processar imagem: {str(e)}',
-            'traceback': traceback.format_exc()
-        }
+        return {'success': False, 'error': f'Erro: {str(e)}'}
 
-
-# ==================== ROTAS DA API ====================
 
 @app.route('/', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
     return jsonify({
         'status': 'online',
         'service': 'xyMath OpenCV API',
         'version': '2.0.0',
-        'pyzbar_available': PYZBAR_AVAILABLE,
-        'features': [
-            'QR Code JSON format',
-            'Multiple marking detection',
-            'Bubble location overlay',
-            'Perspective correction'
-        ]
+        'features': ['QR Code JSON', 'Multiple marking detection', 'Bubble overlay']
     })
 
 
 @app.route('/api/process', methods=['POST'])
 def process_image():
-    """Endpoint principal para processar imagem de gabarito"""
     try:
         data = request.get_json()
-        
         if not data or 'image' not in data:
-            return jsonify({
-                'success': False,
-                'error': 'Imagem não fornecida'
-            }), 400
+            return jsonify({'success': False, 'error': 'Imagem não fornecida'}), 400
         
         image = decode_base64_image(data['image'])
-        
         if image is None:
-            return jsonify({
-                'success': False,
-                'error': 'Não foi possível decodificar a imagem'
-            }), 400
+            return jsonify({'success': False, 'error': 'Erro ao decodificar imagem'}), 400
         
-        result = process_answer_sheet(image)
-        
-        return jsonify(result)
-        
+        return jsonify(process_answer_sheet(image))
     except Exception as e:
-        import traceback
-        return jsonify({
-            'success': False,
-            'error': f'Erro interno: {str(e)}',
-            'traceback': traceback.format_exc()
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/detect-qr', methods=['POST'])
 def detect_qr_only():
-    """Endpoint para detectar apenas o QR Code"""
     try:
         data = request.get_json()
-        
         if not data or 'image' not in data:
-            return jsonify({
-                'success': False,
-                'error': 'Imagem não fornecida'
-            }), 400
+            return jsonify({'success': False, 'error': 'Imagem não fornecida'}), 400
         
         image = decode_base64_image(data['image'])
         qr_data, qr_location = read_qr_code(image)
         
         if qr_data:
-            return jsonify({
-                'success': True,
-                'qr_data': qr_data,
-                'qr_location': qr_location
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'QR Code não encontrado'
-            })
-            
+            return jsonify({'success': True, 'qr_data': qr_data, 'qr_location': qr_location})
+        return jsonify({'success': False, 'error': 'QR Code não encontrado'})
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/scan-frame', methods=['POST'])
-def scan_frame():
-    """
-    Endpoint para leitura contínua (streaming)
-    Retorna rapidamente se detectou QR Code ou não
-    """
-    try:
-        data = request.get_json()
-        
-        if not data or 'image' not in data:
-            return jsonify({'detected': False})
-        
-        image = decode_base64_image(data['image'])
-        
-        if image is None:
-            return jsonify({'detected': False})
-        
-        # Apenas detectar QR Code (rápido)
-        qr_data, qr_location = read_qr_code(image)
-        
-        if qr_data:
-            # QR Code encontrado - processar completo
-            result = process_answer_sheet(image)
-            result['detected'] = True
-            return jsonify(result)
-        else:
-            return jsonify({
-                'detected': False,
-                'message': 'Posicione o QR Code na câmera'
-            })
-            
-    except Exception as e:
-        return jsonify({
-            'detected': False,
-            'error': str(e)
-        })
-
-
-@app.route('/api/batch', methods=['POST'])
-def batch_process():
-    """Endpoint para processar múltiplas imagens"""
-    try:
-        data = request.get_json()
-        
-        if not data or 'images' not in data:
-            return jsonify({
-                'success': False,
-                'error': 'Imagens não fornecidas'
-            }), 400
-        
-        results = []
-        for i, img_base64 in enumerate(data['images']):
-            try:
-                image = decode_base64_image(img_base64)
-                result = process_answer_sheet(image)
-                result['index'] = i
-                results.append(result)
-            except Exception as e:
-                results.append({
-                    'index': i,
-                    'success': False,
-                    'error': str(e)
-                })
-        
-        return jsonify({
-            'success': True,
-            'results': results,
-            'total': len(results),
-            'processed': len([r for r in results if r.get('success')])
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 if __name__ == '__main__':
