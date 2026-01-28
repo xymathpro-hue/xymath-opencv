@@ -1,8 +1,6 @@
 """
-xyMath - API de Correção Automática de Gabaritos
-Usando OpenCV para processamento de imagem
-
-Deploy: Railway
+xyMath - API de Correção Automática de Gabaritos v2.1
+Com rotação automática e debug melhorado
 """
 
 from flask import Flask, request, jsonify
@@ -17,8 +15,8 @@ app = Flask(__name__)
 CORS(app)
 
 # Configurações
-MIN_BUBBLE_AREA = 80
-MAX_BUBBLE_AREA = 3000
+MIN_BUBBLE_AREA = 50
+MAX_BUBBLE_AREA = 5000
 FILLED_THRESHOLD = 0.35
 
 
@@ -33,54 +31,94 @@ def decode_base64_image(base64_string):
     return img
 
 
-def read_qr_code(image):
-    """Lê QR Code usando OpenCV - suporta JSON"""
+def try_read_qr(image):
+    """Tenta ler QR Code de uma imagem"""
     detector = cv2.QRCodeDetector()
     
-    # Tentar com imagem original
+    # Tentar imagem original
     data, vertices, _ = detector.detectAndDecode(image)
-    
-    if not data:
-        # Tentar com escala de cinza
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        data, vertices, _ = detector.detectAndDecode(gray)
-    
-    if not data:
-        # Tentar com threshold
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-        data, vertices, _ = detector.detectAndDecode(thresh)
-    
-    if not data:
-        # Tentar com contraste aumentado
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-        data, vertices, _ = detector.detectAndDecode(enhanced)
-    
     if data:
-        qr_location = None
-        if vertices is not None and len(vertices) > 0:
-            pts = vertices[0]
-            x_coords = [p[0] for p in pts]
-            y_coords = [p[1] for p in pts]
-            qr_location = {
-                'x': int(min(x_coords)),
-                'y': int(min(y_coords)),
-                'width': int(max(x_coords) - min(x_coords)),
-                'height': int(max(y_coords) - min(y_coords))
-            }
-        return parse_qr_data(data), qr_location
+        return data, vertices
+    
+    # Converter para cinza se colorida
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    # Tentar com escala de cinza
+    data, vertices, _ = detector.detectAndDecode(gray)
+    if data:
+        return data, vertices
+    
+    # Tentar com threshold binário
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    data, vertices, _ = detector.detectAndDecode(thresh)
+    if data:
+        return data, vertices
+    
+    # Tentar com threshold inverso
+    _, thresh_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    data, vertices, _ = detector.detectAndDecode(thresh_inv)
+    if data:
+        return data, vertices
+    
+    # Tentar com contraste aumentado (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    data, vertices, _ = detector.detectAndDecode(enhanced)
+    if data:
+        return data, vertices
+    
+    # Tentar com blur + threshold
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh_blur = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    data, vertices, _ = detector.detectAndDecode(thresh_blur)
+    if data:
+        return data, vertices
     
     return None, None
 
 
+def read_qr_code_all_rotations(image):
+    """Tenta ler QR Code em todas as rotações"""
+    rotations = [
+        (None, "original"),
+        (cv2.ROTATE_90_CLOCKWISE, "90_cw"),
+        (cv2.ROTATE_180, "180"),
+        (cv2.ROTATE_90_COUNTERCLOCKWISE, "90_ccw")
+    ]
+    
+    for rotation, name in rotations:
+        if rotation is not None:
+            img = cv2.rotate(image, rotation)
+        else:
+            img = image.copy()
+        
+        data, vertices = try_read_qr(img)
+        if data:
+            qr_location = None
+            if vertices is not None and len(vertices) > 0:
+                pts = vertices[0]
+                x_coords = [p[0] for p in pts]
+                y_coords = [p[1] for p in pts]
+                qr_location = {
+                    'x': int(min(x_coords)),
+                    'y': int(min(y_coords)),
+                    'width': int(max(x_coords) - min(x_coords)),
+                    'height': int(max(y_coords) - min(y_coords))
+                }
+            return parse_qr_data(data), qr_location, rotation, name
+    
+    return None, None, None, None
+
+
 def parse_qr_data(data):
-    """Parse QR Code - suporta JSON e formato pipe"""
+    """Parse QR Code - suporta JSON e pipe"""
     if not data:
         return None
     
-    # Tentar JSON primeiro
+    # Tentar JSON
     try:
         json_data = json.loads(data)
         return {
@@ -92,7 +130,7 @@ def parse_qr_data(data):
     except:
         pass
     
-    # Tentar formato pipe
+    # Tentar pipe
     try:
         parts = data.split('|')
         if len(parts) >= 4:
@@ -110,20 +148,29 @@ def parse_qr_data(data):
 
 def find_corner_markers(image):
     """Detecta os 4 marcadores de canto"""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
+    # Threshold adaptativo
     thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV, 11, 2
     )
     
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
+    img_height, img_width = image.shape[:2]
+    min_marker_area = (img_width * img_height) * 0.0001  # 0.01% da imagem
+    max_marker_area = (img_width * img_height) * 0.01    # 1% da imagem
+    
     markers = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < 300 or area > 15000:
+        if area < min_marker_area or area > max_marker_area:
             continue
         
         peri = cv2.arcLength(contour, True)
@@ -131,31 +178,40 @@ def find_corner_markers(image):
         
         if len(approx) == 4:
             x, y, w, h = cv2.boundingRect(approx)
-            aspect_ratio = w / float(h)
+            aspect_ratio = w / float(h) if h > 0 else 0
             
             if 0.7 <= aspect_ratio <= 1.3:
                 M = cv2.moments(contour)
                 if M["m00"] != 0:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
-                    markers.append((cx, cy, area))
-    
-    markers.sort(key=lambda x: x[2], reverse=True)
-    markers = markers[:4]
+                    markers.append({
+                        'x': cx,
+                        'y': cy,
+                        'area': area,
+                        'rect': {'x': x, 'y': y, 'w': w, 'h': h}
+                    })
     
     if len(markers) < 4:
-        return None
+        return None, markers
     
-    points = [(m[0], m[1]) for m in markers]
-    points = sorted(points, key=lambda p: p[1])
-    top_points = sorted(points[:2], key=lambda p: p[0])
-    bottom_points = sorted(points[2:], key=lambda p: p[0])
+    # Ordenar por área e pegar os 4 maiores
+    markers.sort(key=lambda m: m['area'], reverse=True)
+    top_markers = markers[:4]
     
-    return [top_points[0], top_points[1], bottom_points[1], bottom_points[0]]
+    # Ordenar: top-left, top-right, bottom-right, bottom-left
+    points = [(m['x'], m['y']) for m in top_markers]
+    points = sorted(points, key=lambda p: p[1])  # Ordenar por Y
+    top_points = sorted(points[:2], key=lambda p: p[0])  # Top por X
+    bottom_points = sorted(points[2:], key=lambda p: p[0])  # Bottom por X
+    
+    corners = [top_points[0], top_points[1], bottom_points[1], bottom_points[0]]
+    
+    return corners, top_markers
 
 
 def perspective_transform(image, corners):
-    """Corrige a perspectiva da imagem"""
+    """Corrige perspectiva"""
     pts1 = np.float32(corners)
     
     width = max(
@@ -177,7 +233,11 @@ def perspective_transform(image, corners):
 
 def detect_bubbles(image, num_questions, options_per_question=5):
     """Detecta bolhas preenchidas"""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
     blurred = cv2.GaussianBlur(gray, (3, 3), 0)
     
     thresh = cv2.adaptiveThreshold(
@@ -187,16 +247,21 @@ def detect_bubbles(image, num_questions, options_per_question=5):
     
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    img_height, img_width = image.shape[:2]
+    img_height, img_width = gray.shape[:2]
+    
+    # Calcular tamanho esperado das bolhas baseado na imagem
+    expected_bubble_area = (img_width * img_height) / (num_questions * options_per_question * 50)
+    min_area = expected_bubble_area * 0.3
+    max_area = expected_bubble_area * 3.0
     
     bubbles = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        if MIN_BUBBLE_AREA < area < MAX_BUBBLE_AREA:
+        if min_area < area < max_area:
             perimeter = cv2.arcLength(contour, True)
             if perimeter > 0:
                 circularity = 4 * np.pi * area / (perimeter * perimeter)
-                if circularity > 0.5:
+                if circularity > 0.4:
                     M = cv2.moments(contour)
                     if M["m00"] != 0:
                         cx = int(M["m10"] / M["m00"])
@@ -214,11 +279,11 @@ def detect_bubbles(image, num_questions, options_per_question=5):
                             'rect': {'x': x, 'y': y, 'w': w, 'h': h}
                         })
     
-    if not bubbles:
-        return [None] * num_questions, []
+    if len(bubbles) < num_questions:
+        return [None] * num_questions, [], len(bubbles)
     
     # Layout 2 colunas
-    bubble_area_start_y = int(img_height * 0.20)
+    bubble_area_start_y = int(img_height * 0.18)
     bubble_area_end_y = int(img_height * 0.95)
     bubble_area_height = bubble_area_end_y - bubble_area_start_y
     
@@ -248,19 +313,33 @@ def detect_bubbles(image, num_questions, options_per_question=5):
     for q_idx, q_bubbles in enumerate(questions):
         if not q_bubbles:
             answers.append(None)
-            bubble_locations.append({'question': q_idx + 1, 'answer': None, 'status': 'not_found', 'bubbles': []})
+            bubble_locations.append({
+                'question': q_idx + 1,
+                'answer': None,
+                'status': 'not_found',
+                'bubbles': []
+            })
             continue
         
         q_bubbles.sort(key=lambda b: b['x'])
         avg_intensity = sum(b['intensity'] for b in q_bubbles) / len(q_bubbles)
         
-        filled = [(i, b) for i, b in enumerate(q_bubbles) if b['intensity'] < avg_intensity * (1 - FILLED_THRESHOLD)]
+        filled = []
+        for i, b in enumerate(q_bubbles):
+            if b['intensity'] < avg_intensity * (1 - FILLED_THRESHOLD):
+                filled.append((i, b))
         
         bubbles_info = []
         for i, bubble in enumerate(q_bubbles):
             opt = options[i] if i < len(options) else '?'
             is_filled = any(f[0] == i for f in filled)
-            bubbles_info.append({'option': opt, 'x': bubble['x'], 'y': bubble['y'], 'rect': bubble['rect'], 'filled': is_filled})
+            bubbles_info.append({
+                'option': opt,
+                'x': bubble['x'],
+                'y': bubble['y'],
+                'rect': bubble['rect'],
+                'filled': is_filled
+            })
         
         if len(filled) == 0:
             answers.append(None)
@@ -276,36 +355,83 @@ def detect_bubbles(image, num_questions, options_per_question=5):
             answer = 'X'
             status = 'multiple'
         
-        bubble_locations.append({'question': q_idx + 1, 'answer': answer, 'status': status, 'bubbles': bubbles_info})
+        bubble_locations.append({
+            'question': q_idx + 1,
+            'answer': answer,
+            'status': status,
+            'bubbles': bubbles_info
+        })
     
-    return answers, bubble_locations
+    return answers, bubble_locations, len(bubbles)
 
 
 def process_answer_sheet(image):
-    """Processa folha de respostas completa"""
+    """Processa folha de respostas"""
     try:
+        original_shape = image.shape[:2]
+        debug_info = {
+            'original_size': {'height': original_shape[0], 'width': original_shape[1]},
+            'steps': []
+        }
+        
+        # 1. Tentar ler QR Code em todas as rotações
+        qr_data, qr_location, rotation, rotation_name = read_qr_code_all_rotations(image)
+        
+        debug_info['steps'].append({
+            'step': 'qr_detection',
+            'success': qr_data is not None,
+            'rotation_used': rotation_name
+        })
+        
+        # Se encontrou QR em rotação diferente, rotacionar imagem
+        if rotation is not None:
+            image = cv2.rotate(image, rotation)
+            debug_info['image_rotated'] = rotation_name
+        
         img_height, img_width = image.shape[:2]
+        debug_info['processed_size'] = {'height': img_height, 'width': img_width}
         
-        qr_data, qr_location = read_qr_code(image)
+        # 2. Detectar marcadores de canto
+        corners, all_markers = find_corner_markers(image)
         
-        corners = find_corner_markers(image)
+        debug_info['steps'].append({
+            'step': 'corner_detection',
+            'success': corners is not None,
+            'markers_found': len(all_markers) if all_markers else 0
+        })
         
+        # 3. Corrigir perspectiva se encontrou cantos
         if corners is not None:
             corrected = perspective_transform(image, corners)
-            if qr_data is None:
-                qr_data, qr_location = read_qr_code(corrected)
+            debug_info['perspective_corrected'] = True
         else:
             corrected = image
+            debug_info['perspective_corrected'] = False
+        
+        # 4. Se não leu QR antes, tentar novamente após correção
+        if qr_data is None:
+            qr_data, qr_location, _, _ = read_qr_code_all_rotations(corrected)
+            debug_info['steps'].append({
+                'step': 'qr_detection_after_correction',
+                'success': qr_data is not None
+            })
         
         if qr_data is None:
             return {
                 'success': False,
-                'error': 'QR Code não encontrado. Verifique iluminação e posição.',
-                'corners_found': corners is not None
+                'error': 'QR Code não encontrado. Tente melhorar a iluminação e enquadrar toda a folha.',
+                'debug': debug_info
             }
         
+        # 5. Detectar bolhas
         num_questions = qr_data.get('total_questoes', 20)
-        answers, bubble_locations = detect_bubbles(corrected, num_questions)
+        answers, bubble_locations, total_bubbles = detect_bubbles(corrected, num_questions)
+        
+        debug_info['steps'].append({
+            'step': 'bubble_detection',
+            'total_bubbles_found': total_bubbles,
+            'questions': num_questions
+        })
         
         return {
             'success': True,
@@ -319,20 +445,33 @@ def process_answer_sheet(image):
             'total_blank': len([a for a in answers if a is None]),
             'total_multiple': len([a for a in answers if a == 'X']),
             'corners_found': corners is not None,
-            'image_size': {'width': img_width, 'height': img_height}
+            'debug': debug_info
         }
         
     except Exception as e:
-        return {'success': False, 'error': f'Erro: {str(e)}'}
+        import traceback
+        return {
+            'success': False,
+            'error': f'Erro: {str(e)}',
+            'traceback': traceback.format_exc()
+        }
 
+
+# ==================== ROTAS ====================
 
 @app.route('/', methods=['GET'])
 def health_check():
     return jsonify({
         'status': 'online',
         'service': 'xyMath OpenCV API',
-        'version': '2.0.0',
-        'features': ['QR Code JSON', 'Multiple marking detection', 'Bubble overlay']
+        'version': '2.1.0',
+        'features': [
+            'Auto-rotation detection',
+            'QR Code JSON support',
+            'Multiple marking detection',
+            'Corner calibration',
+            'Debug info'
+        ]
     })
 
 
@@ -360,10 +499,15 @@ def detect_qr_only():
             return jsonify({'success': False, 'error': 'Imagem não fornecida'}), 400
         
         image = decode_base64_image(data['image'])
-        qr_data, qr_location = read_qr_code(image)
+        qr_data, qr_location, rotation, rotation_name = read_qr_code_all_rotations(image)
         
         if qr_data:
-            return jsonify({'success': True, 'qr_data': qr_data, 'qr_location': qr_location})
+            return jsonify({
+                'success': True,
+                'qr_data': qr_data,
+                'qr_location': qr_location,
+                'rotation': rotation_name
+            })
         return jsonify({'success': False, 'error': 'QR Code não encontrado'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
